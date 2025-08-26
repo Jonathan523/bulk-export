@@ -3,15 +3,19 @@ package main
 import (
 	"encoding/csv"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
+	progressbar "github.com/schollz/progressbar/v3"
+	"github.com/sirupsen/logrus"
 )
+
+var logger = logrus.New()
 
 type Row struct {
 	Era     string
@@ -24,6 +28,25 @@ type Row struct {
 }
 
 func fetchRows(char string) ([]Row, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		logger.WithFields(logrus.Fields{"char": char, "attempt": attempt}).Debug("requesting")
+		rows, err := fetchRowsOnce(char)
+		if err == nil && len(rows) > 0 {
+			logger.WithFields(logrus.Fields{"char": char, "rows": len(rows)}).Debug("fetched")
+			return rows, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("empty response")
+		}
+		lastErr = err
+		logger.WithFields(logrus.Fields{"char": char, "attempt": attempt}).WithError(err).Warn("fetch failed")
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return nil, fmt.Errorf("fetch %s failed: %w", char, lastErr)
+}
+
+func fetchRowsOnce(char string) ([]Row, error) {
 	form := url.Values{}
 	form.Set("word", char)
 	form.Set("bianti", "no")
@@ -41,6 +64,10 @@ func fetchRows(char string) ([]Row, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %s", resp.Status)
+	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
@@ -83,6 +110,9 @@ func fetchRows(char string) ([]Row, error) {
 }
 
 func main() {
+	logger.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+	logger.SetLevel(logrus.DebugLevel)
+
 	if len(os.Args) < 2 {
 		fmt.Println("usage: bulk-export <text> [output.csv]")
 		os.Exit(1)
@@ -95,13 +125,20 @@ func main() {
 
 	chars := []rune(text)
 	if len(chars) == 0 {
-		log.Fatal("no characters provided")
+		logger.Fatal("no characters provided")
 	}
+	for _, ch := range chars {
+		if !unicode.Is(unicode.Han, ch) {
+			logger.Fatalf("invalid character: %q", ch)
+		}
+	}
+	logger.Infof("processing %d characters", len(chars))
 
 	firstRows, err := fetchRows(string(chars[0]))
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
+	logger.Infof("retrieved %d scholar rows for %c", len(firstRows), chars[0])
 	keys := make([]string, len(firstRows))
 	for i, r := range firstRows {
 		keys[i] = r.Era + "|" + r.Nature + "|" + r.Scholar
@@ -109,7 +146,7 @@ func main() {
 
 	file, err := os.Create(output)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal(err)
 	}
 	defer file.Close()
 
@@ -118,16 +155,24 @@ func main() {
 
 	w.Write([]string{"字", "學者", "擬音[經整理]", "擬音[原材料]", "韻部", "原表其他信息"})
 
+	bar := progressbar.NewOptions(len(chars),
+		progressbar.OptionSetDescription("Processing"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionClearOnFinish(),
+	)
+
 	for idx, ch := range chars {
+		logger.Infof("fetching %c (%d/%d)", ch, idx+1, len(chars))
 		var rows []Row
 		if idx == 0 {
 			rows = firstRows
 		} else {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(1 * time.Second)
 			var err error
 			rows, err = fetchRows(string(ch))
 			if err != nil {
-				log.Printf("fetch %c failed: %v", ch, err)
+				logger.WithError(err).Warnf("fetch %c failed", ch)
+				bar.Add(1)
 				continue
 			}
 		}
@@ -144,5 +189,7 @@ func main() {
 			}
 			w.Write([]string{string(ch), r.Scholar, r.Sorted, r.Raw, r.Rhyme, r.Info})
 		}
+		bar.Add(1)
 	}
+	logger.Infof("output written to %s", output)
 }
